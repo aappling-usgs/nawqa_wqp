@@ -17,7 +17,7 @@ targets:
 
   3_wtemp:
     depends:
-      - 1_nwisdata/log/tasks_1_nwis.ind
+      - wtemp_site_count
 
   wtemp_site_count:
     command: count_wtemp_sites(

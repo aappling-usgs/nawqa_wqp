@@ -9,27 +9,166 @@ output: html_document
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-```{r file_dependencies}
-nwis_inv_ind="1_nwisdata/out/inventory/nwis_inventory.rds.ind"
-wqp_inv_ind="1_wqpdata/tmp/data/inventory_temperature.feather.ind"
+```{r dependencies, include=FALSE}
+library(dplyr)
+library(ggplot2)
+library(feather)
+library(scipiper)
+library(tidyr)
+
+# sc_retrieve("1_nwisdata/out/inventory/nwis_inventory.rds.ind")
+nwis_inv_file="../../1_nwisdata/out/inventory/nwis_inventory.rds"
+
+# sc_retrieve("1_wqpdata/tmp/data/inventory_temperature.feather.ind")
+wqp_inv_file="../../1_wqpdata/tmp/data/inventory_temperature.feather"
+
+# options(scipiper.dry_put = TRUE)
+# scmake("tasks_1_wqp_inventory.yml")
+# scmake("1_wqpdata/tmp/data/partition_temperature.rds.ind", remake_file="tasks_1_wqp_inventory.yml")
+# scmake("tasks_1_wqp.yml")
+# scmake("tasks_1_wqp_temperature.yml", remake_file="tasks_1_wqp.yml")
+# wqp_data_ind <- dir("1_wqpdata/out/data", pattern=".*temperature_[[:digit:]]{3}\\.feather\\.ind", full.names=TRUE)
+# wqp_data_files <- sapply(wqp_data_ind, function(wdi) {
+#   message(wdi)
+#   gd_get(wdi)
+# })
+wqp_data_files <- file.path("../..", dir("1_wqpdata/out/data", pattern=".*temperature_[[:digit:]]{3}\\.feather$", full.names=TRUE))
 ```
 
-## 
+## Continuous monitoring sites from NWIS
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+We'll use an NWIS inventory to learn about continuous water temperature data. 
+Eventually it'd be nice to pull down all the NWIS samples, but until then,
+we need to take shortcuts to approximately determine which sites have good
+continuous monitoring coverage.
 
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+Our inventory query took this form:
+```{r nwis_inv_eg, eval=FALSE}
+dataRetrieval::whatNWISdata(
+  siteType=c('ST', 'ST-CA', 'ST-DCH', 'ST-TS'), # any kind of stream
+  service='uv', # unit-value data only
+  parameterCd='00010' # water temperature
+  # we'd include startDt and endDt, but they get ignored by the service behind whatNWISdata
+)
+```
+(We actually requested data one state at a time, looping over all states, but all the other arguments are as above.)
 
-```{r cars}
-summary(cars)
+The full inventory takes a while to run, so we just load it from file here:
+```{r nwis_inv_load}
+nwis_inventory <- readRDS(nwis_inv_file)
 ```
 
-## Including Plots
+Unfortunately, the only coverage information we receive is in the `begin_date` and `end_date` columns of the NWIS inventory. 
+The `count_nu` column sounds promising but is not an accurate reflection of the
+number of observations, or even the number of days with observations - it's a very basic calculation
+of `end_date` - `begin_date`. So we'll just use those dates directly as our
+best-available source of information.
 
-You can also embed plots, for example:
-
-```{r pressure, echo=FALSE}
-plot(pressure)
+We need to make an arbitrary choice about how to define "continuous". We'll go with sites where monitoring occurred over some minimum date range, thereby eliminating sites with short periods of record.
+To help with the decision of how short is too short, we can consider the typical range (leaving out a few outliers with begin dates before 2007 or end dates in the future):
+```{r begin_end_dates}
+nwis_inventory %>%
+  mutate(date_range = as.numeric(end_date - begin_date, units='days')) %>%
+  ggplot(aes(x=date_range)) +
+  geom_histogram(binwidth=365.25/4) +
+  geom_rug() +
+  theme_bw() +
+  xlab('Date range (days)') + ylab('Number of sites with date range')
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+We can quantify the relationship between our threshold choice and the number of sites we'll get back as follows:
+```{r nwis_threshold_effect}
+nwis_site_counts <- data_frame(
+  range_threshold = seq(1, as.numeric(4000, units='days'), by=50),
+  site_count = sapply(range_threshold, function(range_thresh) {
+    nwis_inventory %>%
+      filter(end_date - begin_date >= as.difftime(range_thresh, units='days')) %>%
+      pull(site_no) %>%
+      unique() %>%
+      length()
+  }))
+ggplot(nwis_site_counts, aes(x=range_threshold, y=site_count)) + geom_line() +
+  theme_bw() +
+  xlab('Date range threshold (days)') + ylab('Number of sites with date range >= threshold')
+```
+
+Based on the above plots and some arbitrary decisions, we define "continuous" as sites having monitoring occurring over a 2000-day range.
+This seems reasonable to us because the maximum typical range is nearly 4000 days, and the distribution of date ranges among sites below that maximum is fairly uniform. However, thresholds of 1000, 3000, or 3900 could also make sense depending on the needs of the trends analyses.
+
+Now we extract and count site IDs for those sites meeting the date range threshold criterion.
+```{r nwis_inv_filter}
+range_threshold <- 2000 # choose the threshold
+continuous_sites <- nwis_inventory %>%
+  filter(end_date - begin_date >= as.difftime(range_threshold, units='days')) %>%
+  pull(site_no) %>% # exract site IDs
+  unique() # remove duplicates, which typically arise when temp is monitored at multiple depths
+length(continuous_sites)
+```
+
+This threshold approach is imperfect. We'd rather look at how many days were monitored per year, and with how many data gaps, but we can't get that information from NWIS without pulling the data themselves, which will take a while.
+
+## Discrete sampling sites from WQP
+
+We have already pulled all the available WQP temperature data for 2010-2015, so we can look at temporal coverage more thoroughly for this dataset. We'll start by loading the data from file.
+```{r load_wqp}
+wqp_data <- bind_rows(lapply(wqp_data_files, function(data_file) {
+  dat <- feather::read_feather(data_file)
+  if(nrow(dat) > 0) {
+    NA_DT <- which(is.na(dat$ActivityStartDateTime))
+    if(length(NA_DT) > 0) dat[NA_DT,'ActivityStartDateTime'] <- as.POSIXct(dat$ActivityStartDate[NA_DT])
+    dat %>% select(MonitoringLocationIdentifier, ActivityStartDateTime)
+  } else {
+    data_frame(MonitoringLocationIdentifier='', ActivityStartDateTime=Sys.time()) %>% filter(FALSE)
+  }
+}))
+head(wqp_data)
+```
+
+Now we can look at thresholds by number of years at some minimum number of observations per year.
+```{r count_peryear}
+wqp_peryear_counts <- wqp_data %>%
+  mutate(ActivityYear = strftime(ActivityStartDateTime, '%Y')) %>%
+  group_by(MonitoringLocationIdentifier, ActivityYear) %>%
+  summarize(NumObs = length(ActivityStartDateTime)) %>% 
+  ungroup()
+wqp_peryear_counts
+```
+
+```{r count_years}
+wqp_year_counts <- wqp_peryear_counts %>%
+  filter(NumObs >= 6) %>%
+  group_by(MonitoringLocationIdentifier) %>%
+  summarize(NumFullYears = length(ActivityYear))
+wqp_year_counts
+```
+
+```{r filter_wqp}
+discrete_sites <- wqp_year_counts %>%
+  filter(NumFullYears >= 4) %>%
+  pull(MonitoringLocationIdentifier)
+discrete_sites
+```
+
+
+## Sites with continuous and discrete data
+
+Now we join by USGS ID and find those sites that meet the criteria for both NWIS and WQP data. This gets rid of a lot of agency-monitored sites in WQP, though it's possible that some of those are close to USGS monitoring stations and might be matched up with a space-based crosswalk.
+```{r combine_nwis_wqp}
+usgs_discrete_sites <- gsub('USGS-', '', grep('USGS-', discrete_sites, value=TRUE))
+nwis_wqp_sites <- intersect(usgs_discrete_sites, continuous_sites)
+length(nwis_wqp_sites)
+```
+
+We can plot these sites by looking to the WQP inventory for coordinates
+
+```{r}
+wqp_inventory <- feather::read_feather(wqp_inv_file)
+nwis_wqp_site_info <- wqp_inventory %>%
+  filter(Constituent == 'temperature') %>%
+  filter(MonitoringLocationIdentifier %in% paste0('USGS-', nwis_wqp_sites))
+```
+
+```{r map}
+library(ggmap)
+ggplot(nwis_wqp_site_info, aes(x=LongitudeMeasure, y=LatitudeMeasure)) + geom_point()
+```
