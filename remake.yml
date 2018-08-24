@@ -1,6 +1,9 @@
 target_default: all
 
 include:
+  - lib.yml
+  - 1_nwisdata.yml
+  - 1_wqpdata.yml
   - 3_wtemp.yml
 
 targets:

@@ -1,9 +1,5 @@
 target_default: 1_nwisdata
 
-# include 1_wqpdata.yml mainly to get the lib.yml targets without reading those targets twice
-include:
-  - 1_wqpdata.yml
-
 packages:
   - dataRetrieval
   - dplyr

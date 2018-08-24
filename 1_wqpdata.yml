@@ -1,8 +1,5 @@
 target_default: 1_wqpdata
 
-include:
-  - lib.yml
-
 packages:
   - dataRetrieval
   - dplyr
