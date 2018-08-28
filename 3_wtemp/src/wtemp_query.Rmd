@@ -16,6 +16,8 @@ library(feather)
 library(scipiper)
 library(tidyr)
 
+# setwd('3_wtemp/src') # if running manually rather than knitting the whole document
+
 # sc_retrieve("1_nwisdata/out/inventory/nwis_inventory.rds.ind")
 nwis_inv_file="../../1_nwisdata/out/inventory/nwis_inventory.rds"
 
@@ -32,7 +34,7 @@ wqp_inv_file="../../1_wqpdata/tmp/data/inventory_temperature.feather"
 #   message(wdi)
 #   gd_get(wdi)
 # })
-wqp_data_files <- file.path("../..", dir("1_wqpdata/out/data", pattern=".*temperature_[[:digit:]]{3}\\.feather$", full.names=TRUE))
+wqp_data_files <- dir("../../1_wqpdata/out/data", pattern=".*temperature_[[:digit:]]{3}\\.feather$", full.names=TRUE)
 ```
 
 ## Continuous monitoring sites from NWIS
@@ -134,6 +136,7 @@ wqp_peryear_counts <- wqp_data %>%
 wqp_peryear_counts
 ```
 
+We fix the minimum number of observations at 6 such that only years with 6 or more observations count as "Complete".
 ```{r count_years}
 wqp_year_counts <- wqp_peryear_counts %>%
   filter(NumObs >= 6) %>%
@@ -142,33 +145,176 @@ wqp_year_counts <- wqp_peryear_counts %>%
 wqp_year_counts
 ```
 
+Here is the distribution of "Complete" years at each site. For the first round of this analysis, we are working with the time period of 2010 to 2015, so that the maximum number of complete years is just 6. We are working to expand this by pulling down more WQP data.
+```{r plot_count_years}
+ggplot(wqp_year_counts, aes(x=NumFullYears)) + geom_histogram(binwidth=1) +
+  xlab("Number of Complete Years") + ylab("Number of Sites with X Complete Years")
+```
+
+For today we choose a threshold that only sites with 4 or more complete years count as having adequate discrete-sampling regimes for the trends analysis. This threshold will undoubtedly change when we have pulled in more WQP data (to reflect the higher possible number of complete years) and could also be adjusted to better reflect the needs of the trends analysis.
 ```{r filter_wqp}
 discrete_sites <- wqp_year_counts %>%
   filter(NumFullYears >= 4) %>%
   pull(MonitoringLocationIdentifier)
-discrete_sites
+length(discrete_sites)
+```
+
+Of these qualifying discrete sites, only those with a USGS identifier could possibly also be directly, continuously monitored by USGS, so we next restrict our list to those sites. This gets rid of a lot of agency-monitored sites in WQP, though it's possible that some of those are close to USGS monitoring stations and might be matched up with a space-based crosswalk in the future.
+```{r usgs_wqp_sites}
+usgs_discrete_sites <- gsub('USGS-', '', grep('USGS-', discrete_sites, value=TRUE))
+length(usgs_discrete_sites)
 ```
 
 
 ## Sites with continuous and discrete data
 
-Now we join by USGS ID and find those sites that meet the criteria for both NWIS and WQP data. This gets rid of a lot of agency-monitored sites in WQP, though it's possible that some of those are close to USGS monitoring stations and might be matched up with a space-based crosswalk.
+Now we join by USGS ID to find those sites that meet the criteria for both NWIS and WQP data. 
 ```{r combine_nwis_wqp}
-usgs_discrete_sites <- gsub('USGS-', '', grep('USGS-', discrete_sites, value=TRUE))
 nwis_wqp_sites <- intersect(usgs_discrete_sites, continuous_sites)
 length(nwis_wqp_sites)
 ```
 
-We can plot these sites by looking to the WQP inventory for coordinates
+We can plot these sites by looking to WQP for state codes and NWIS for coordinates (NWIS coordinates are more precise than those supplied by WQP, by several digits).
 
 ```{r}
-wqp_inventory <- feather::read_feather(wqp_inv_file)
-nwis_wqp_site_info <- wqp_inventory %>%
-  filter(Constituent == 'temperature') %>%
-  filter(MonitoringLocationIdentifier %in% paste0('USGS-', nwis_wqp_sites))
+site_coords <- dataRetrieval::whatNWISsites(sites=c(usgs_discrete_sites, continuous_sites)) %>%
+  mutate(
+    Both = site_no %in% usgs_discrete_sites & site_no %in% continuous_sites,
+    JustDiscrete = site_no %in% usgs_discrete_sites & !Both,
+    JustContinuous = site_no %in% continuous_sites & !Both,
+    Type = case_when(Both ~ "Both", JustDiscrete ~ "Discrete", JustContinuous ~ "Continuous")
+  )
 ```
 
-```{r map}
-library(ggmap)
-ggplot(nwis_wqp_site_info, aes(x=LongitudeMeasure, y=LatitudeMeasure)) + geom_point()
+```{r map_utils, include=FALSE}
+library(maptools)
+library(maps)
+library(sp) 
+library(rgdal) # required for spTransform
+
+# utility functions for getting and shifting map data
+to_sp <- function(...){
+  map <- maps::map(..., fill=TRUE, plot = FALSE)
+  IDs <- sapply(strsplit(map$names, ":"), function(x) x[1])
+  map.sp <- maptools::map2SpatialPolygons(map, IDs=IDs, proj4string=CRS(latlon.string))
+  map.sp.t <- spTransform(map.sp, CRS(proj.string))
+  return(map.sp.t)
+}
+shift_sp <- function(sp, scale, shift, rotate = 0, ref=sp, proj.string=NULL, row.names=NULL){
+  orig.cent <- rgeos::gCentroid(ref, byid=TRUE)@coords
+  scale <- max(apply(bbox(ref), 1, diff)) * scale
+  obj <- elide(sp, rotate=rotate, center=orig.cent, bb = bbox(ref))
+  ref <- elide(ref, rotate=rotate, center=orig.cent, bb = bbox(ref))
+  obj <- elide(obj, scale=scale, center=orig.cent, bb = bbox(ref))
+  ref <- elide(ref, scale=scale, center=orig.cent, bb = bbox(ref))
+  new.cent <- rgeos::gCentroid(ref, byid=TRUE)@coords
+  obj <- elide(obj, shift=shift*10000+c(orig.cent-new.cent))
+  if (is.null(proj.string)){
+    proj4string(obj) <- proj4string(sp)
+  } else {
+    proj4string(obj) <- proj.string
+  }
+  
+  if (!is.null(row.names)){
+    row.names(obj) <- row.names
+  }
+  return(obj)
+}
+
+# define projections
+latlon.string <- '+proj=longlat +datum=WGS84 +no_defs'
+proj.string <- '+proj=laea +lat_0=45 +lon_0=-100 +x_0=0 +y_0=0 +a=6370997 +b=6370997 +units=m +no_defs'
+
+# get map data and prepare for shifting
+conus <- to_sp('state')
+stuff_to_move <- list(
+  'alaska' = to_sp("world", "USA:alaska"),
+  'hawaii' = to_sp("world", "USA:hawaii"),
+  'puerto rico' = to_sp("world", "Puerto Rico")
+)
+move_variables <- list(
+  'alaska' = list(scale=0.33, shift = c(80,-450), rotate=-50),
+  'hawaii' = list(scale=1, shift=c(520, -110), rotate=-35),
+  'puerto rico' = list(scale=2.5, shift = c(-140, 90), rotate=20)
+)
+
+# build states (polygons) and sites (points) iteratively
+states <- conus
+sites <- cbind(site_coords$dec_long_va, site_coords$dec_lat_va) %>%
+  SpatialPointsDataFrame(data=select(site_coords, site_no, station_nm, Type), proj4string = CRS(latlon.string)) %>% 
+  spTransform(CRS(proj4string(states)))
+for(i in names(move_variables)){
+  state_to_move <- stuff_to_move[[i]]
+  sites_to_move <- which(!is.na(sp::over(sites, state_to_move)))
+  
+  shifted_states <- do.call(
+    shift_sp,
+    c(sp = state_to_move, 
+      move_variables[[i]],  
+      proj.string = proj4string(conus),
+      row.names = i))
+  states <- rbind(shifted_states, states, makeUniqueIDs = TRUE)
+  
+  if(length(sites_to_move) > 0) {
+    shifted_sites <- do.call(
+      shift_sp,
+      c(sp = SpatialPoints(sites[sites_to_move, ]),
+        move_variables[[i]],
+        proj.string = proj4string(conus),
+        ref=state_to_move)) %>%
+      SpatialPointsDataFrame(data=sites[sites_to_move,]@data, match.ID=FALSE)
+    # Warning we're suppressing: In SpatialPointsDataFrame(sp, df, coords.nrs =
+    # dots[[1]]@coords.nrs) : forming a SpatialPointsDataFrame based on maching
+    # IDs, not on record order. Use match.ID = FALSE to match on record order
+    sites <- suppressWarnings(rbind(sites[-sites_to_move, ], shifted_sites))
+  }
+}
+```
+
+```{r map, fig.width=6, fig.height=4}
+library(ggplot2)
+g <- ggplot() +
+  geom_polygon(
+    data = states, 
+    aes(x = long, y = lat, group = group),
+    fill = "grey90",
+    alpha = 0.5, color = "white") +
+  geom_point(
+    data = filter(as.data.frame(sites), Type != 'Both'), 
+    aes(x = coords.x1, y=coords.x2, color=Type),
+    size = 1.4, alpha=0.8) +
+  geom_point(
+    data = filter(as.data.frame(sites), Type == 'Both'),
+    aes(x = coords.x1, y=coords.x2, color=Type),
+    size = 1.4, alpha=0.8) +
+  coord_fixed() +
+  theme_minimal() +
+  theme(panel.grid = element_blank(),
+        axis.text = element_blank(),
+        axis.title = element_blank(),
+        legend.position = 'bottom')
+ggsave('map.png', plot=g, width=9, height=6.5, device='png', dpi=450)
+g
+```
+
+```{r totals_table, results='asis'}
+data_frame(
+  Continuous = length(continuous_sites),
+  Discrete = length(usgs_discrete_sites),
+  Both = length(nwis_wqp_sites)) %>%
+  knitr::kable(caption="Counts of USGS sites with continuous and/or discrete monitoring above our thresholds")
+```
+
+
+```{r states_table, results='asis'}
+for(st in names(states)) {
+  state <- states[st]
+  sites_in_state <- which(!is.na(sp::over(sites, state)))
+  sites[sites_in_state, 'State'] <- st
+}
+as_data_frame(sites) %>%
+  group_by(State, Type) %>%
+  summarize(NumSites = length(site_no)) %>%
+  tidyr::spread(Type, NumSites, fill=0) %>%
+  knitr::kable(caption="Counts of USGS sites by monitoring type[s] by state")
 ```
