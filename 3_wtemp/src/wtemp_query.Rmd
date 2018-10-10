@@ -151,10 +151,26 @@ ggplot(wqp_year_counts, aes(x=NumFullYears)) + geom_histogram(binwidth=1) +
   xlab("Number of Complete Years") + ylab("Number of Sites with X Complete Years")
 ```
 
+```{r wqp_threshold_effect}
+wqp_site_counts <- data_frame(
+  range_threshold = 1:20,
+  site_count = sapply(range_threshold, function(range_thresh) {
+    wqp_year_counts %>%
+      filter(NumFullYears >= range_thresh) %>%
+      pull(MonitoringLocationIdentifier) %>%
+      unique() %>%
+      length()
+  }))
+ggplot(wqp_site_counts, aes(x=range_threshold, y=site_count)) + geom_line() +
+  theme_bw() +
+  xlab('Complete years threshold (years)') + ylab('Number of sites with complete years >= threshold')
+```
+
+
 For today we choose a threshold that only sites with 4 or more complete years count as having adequate discrete-sampling regimes for the trends analysis. This threshold will undoubtedly change when we have pulled in more WQP data (to reflect the higher possible number of complete years) and could also be adjusted to better reflect the needs of the trends analysis.
 ```{r filter_wqp}
 discrete_sites <- wqp_year_counts %>%
-  filter(NumFullYears >= 4) %>%
+  filter(NumFullYears >= 15) %>%
   pull(MonitoringLocationIdentifier)
 length(discrete_sites)
 ```
